@@ -79,7 +79,11 @@ router.get("/me", requireAuth, validateQuery(myTicketsQuerySchema), listMyTicket
  * /api/v1/tickets/{ticketId}:
  *   get:
  *     summary: Get ticket details
- *     description: Retrieves details of a specific ticket (registration) including the QR code data URL.
+ *     description: |
+ *       Retrieves details of a specific ticket (registration). For the event
+ *       owner, an ADMIN, or the ticket holder (email match) the response
+ *       includes `qr.token` — the raw opaque scan token — and a `qr.image` data
+ *       URL encoding that same token, so gate-scannable PDFs can be rebuilt.
  *     tags: [Tickets]
  *     security:
  *       - bearerAuth: []

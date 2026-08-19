@@ -57,6 +57,9 @@ vi.mock('../../../database/index.js', () => ({
     user: {
       findUnique: vi.fn(),
     },
+    qrToken: {
+      update: vi.fn(),
+    },
   },
 }));
 
@@ -116,6 +119,7 @@ function buildMockRegistration(overrides = {}) {
 describe('generateTicketPdf', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(qrService, 'recoverRawToken').mockResolvedValue('raw-scan-token');
   });
 
   it('should return a PDFDocument stream for event owner', async () => {
@@ -141,12 +145,16 @@ describe('generateTicketPdf', () => {
     expect(textCalls).toContain('Confirmation Code: CNF-ABC-123');
   });
 
-  it('should embed the QR image when a qrToken exists', async () => {
+  it('should embed the QR image encoding the raw scan token when a qrToken exists', async () => {
     prisma.registration.findUnique.mockResolvedValue(buildMockRegistration());
     vi.spyOn(qrService, 'createQrImage').mockResolvedValue(Buffer.from('mock-png'));
 
     const doc = await generateTicketPdf('reg-1', OWNER_USER);
-    expect(qrService.createQrImage).toHaveBeenCalledWith('abc123def456', { width: 150 });
+    expect(qrService.recoverRawToken).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'qr-1' }),
+      expect.objectContaining({ ownerId: OWNER_USER })
+    );
+    expect(qrService.createQrImage).toHaveBeenCalledWith('raw-scan-token', { width: 150 });
     expect(doc.image).toHaveBeenCalledWith(
       expect.any(Buffer),
       expect.any(Number),

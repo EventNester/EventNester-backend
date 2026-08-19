@@ -69,6 +69,7 @@ vi.mock('../../../database/index.js', () => {
 vi.mock('../../tickets/qr.service.js', () => ({
   qrService: {
     generateToken: vi.fn(),
+    recoverRawToken: vi.fn(),
     createQrImage: vi.fn(),
   },
 }));
@@ -290,12 +291,17 @@ describe('Registration Service', () => {
     it('completes QR issuance for a CONFIRMED registration that never got its QR', async () => {
       const pendingQr = { ...baseRegistration, qrIssued: false, id: 'reg-existing' };
       prisma.registration.findUnique.mockResolvedValue(pendingQr);
-      prisma.qrToken.findUnique.mockResolvedValue({ tokenHash: 'existing-hash' });
+      prisma.qrToken.findUnique.mockResolvedValue({ id: 'qr-existing', tokenHash: 'existing-hash', tokenCipher: 'existing-cipher' });
+      qrService.recoverRawToken.mockResolvedValue('existing-raw-token');
 
       const result = await registerFree({ slug: 'tech-summit', name: 'Ada', email: attendeeEmail });
 
-      expect(result.qr.token).toBe('existing-hash');
+      expect(result.qr.token).toBe('existing-raw-token');
       expect(result.registration.id).toBe('reg-existing');
+      expect(qrService.recoverRawToken).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'qr-existing' }),
+        expect.objectContaining({ id: eventId })
+      );
       expect(qrService.generateToken).not.toHaveBeenCalled();
       expect(prisma.registration.update).toHaveBeenCalledWith({
         where: { id: 'reg-existing' },
