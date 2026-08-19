@@ -12,6 +12,9 @@ vi.mock("../../../database/index.js", () => ({
     user: {
       findUnique: vi.fn(),
     },
+    qrToken: {
+      findUnique: vi.fn(),
+    },
     registration: {
       findMany: vi.fn(),
       count: vi.fn(),
@@ -34,7 +37,7 @@ vi.mock("../../registrations/registration.service.js", () => ({
 }));
 
 vi.mock("../qr.service.js", () => ({
-  qrService: { createQrImage: vi.fn() },
+  qrService: { createQrImage: vi.fn(), recoverRawToken: vi.fn() },
 }));
 
 vi.mock("../ticket-pdf.service.js", () => ({
@@ -79,10 +82,12 @@ describe("TicketType Service (unit)", () => {
     prisma.event.findUnique.mockResolvedValue(mockEvent);
     prisma.eventStaffAssignment.findUnique.mockResolvedValue(null);
     prisma.user.findUnique.mockResolvedValue(null);
+    prisma.qrToken.findUnique.mockResolvedValue(null);
     prisma.registration.findMany.mockResolvedValue([]);
     getRegistrationById.mockResolvedValue(null);
     listRegistrationsByEvent.mockResolvedValue({ registrations: [], pagination: {} });
     qrService.createQrImage.mockResolvedValue(Buffer.from("qr"));
+    qrService.recoverRawToken.mockResolvedValue(null);
   });
 
   function loadModule() {
@@ -299,55 +304,87 @@ describe("TicketType Service (unit)", () => {
       ticketCode: { code: "TC-1" },
     };
 
-    it("returns the ticket with a QR data URL for the event owner", async () => {
+    const qrRecord = {
+      id: "qr_1",
+      registrationId: "reg_1",
+      tokenCipher: "cipher",
+      revokedAt: null,
+    };
+
+    it("returns the ticket with the scan token and QR image for the event owner", async () => {
       getRegistrationById.mockResolvedValue(registration);
+      prisma.qrToken.findUnique.mockResolvedValue(qrRecord);
+      qrService.recoverRawToken.mockResolvedValue("raw-token");
       qrService.createQrImage.mockResolvedValue(Buffer.from("qr-bytes"));
 
       const { getTicketDetails } = await loadModule();
-      const result = await getTicketDetails("reg_1", mockUserId);
+      const result = await getTicketDetails("reg_1", mockUserId, "ORGANIZER");
 
       expect(result).toEqual({
         ...registration,
+        qr: { token: "raw-token", image: "data:image/png;base64,cXItYnl0ZXM=" },
         qrDataUrl: "data:image/png;base64,cXItYnl0ZXM=",
       });
       expect(getRegistrationById).toHaveBeenCalledWith("reg_1");
-      expect(prisma.event.findUnique).toHaveBeenCalledWith({
-        where: { id: mockEventId },
-        select: { ownerId: true },
+      expect(prisma.qrToken.findUnique).toHaveBeenCalledWith({
+        where: { registrationId: "reg_1" },
       });
-      expect(qrService.createQrImage).toHaveBeenCalledWith("TC-1");
+      expect(qrService.recoverRawToken).toHaveBeenCalledWith(qrRecord, expect.any(Object));
+      expect(qrService.createQrImage).toHaveBeenCalledWith("raw-token");
     });
 
-    it("returns null qrDataUrl when the registration has no ticket code", async () => {
-      getRegistrationById.mockResolvedValue({ ...registration, ticketCode: null });
+    it("returns null qr values when the registration has no QR token", async () => {
+      getRegistrationById.mockResolvedValue(registration);
+      prisma.qrToken.findUnique.mockResolvedValue(null);
 
       const { getTicketDetails } = await loadModule();
-      const result = await getTicketDetails("reg_1", mockUserId);
+      const result = await getTicketDetails("reg_1", mockUserId, "ORGANIZER");
 
+      expect(result.qr).toEqual({ token: null, image: null });
       expect(result.qrDataUrl).toBeNull();
       expect(qrService.createQrImage).not.toHaveBeenCalled();
     });
 
-    it("allows the attendee by matching their email", async () => {
+    it("allows the attendee by matching their email and returns the token", async () => {
       prisma.event.findUnique.mockResolvedValue({ ownerId: "other_user" });
       prisma.user.findUnique.mockResolvedValue({ id: "attendee", email: "ada@example.com" });
       getRegistrationById.mockResolvedValue(registration);
+      prisma.qrToken.findUnique.mockResolvedValue(qrRecord);
+      qrService.recoverRawToken.mockResolvedValue("attendee-token");
 
       const { getTicketDetails } = await loadModule();
-      const result = await getTicketDetails("reg_1", "attendee");
+      const result = await getTicketDetails("reg_1", "attendee", "ATTENDEE");
 
       expect(result.id).toBe("reg_1");
+      expect(result.qr.token).toBe("attendee-token");
     });
 
-    it("allows assigned staff", async () => {
+    it("allows an ADMIN to view details and the token for events they do not own", async () => {
+      prisma.event.findUnique.mockResolvedValue({ ownerId: "other_user" });
+      getRegistrationById.mockResolvedValue(registration);
+      prisma.qrToken.findUnique.mockResolvedValue(qrRecord);
+      qrService.recoverRawToken.mockResolvedValue("admin-token");
+
+      const { getTicketDetails } = await loadModule();
+      const result = await getTicketDetails("reg_1", "admin_1", "ADMIN");
+
+      expect(result.qr.token).toBe("admin-token");
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(prisma.eventStaffAssignment.findUnique).not.toHaveBeenCalled();
+    });
+
+    it("allows assigned staff to view details but never the raw token", async () => {
       prisma.event.findUnique.mockResolvedValue({ ownerId: "other_user" });
       prisma.eventStaffAssignment.findUnique.mockResolvedValue({ eventId: mockEventId, userId: "staff", active: true });
       getRegistrationById.mockResolvedValue(registration);
+      prisma.qrToken.findUnique.mockResolvedValue(qrRecord);
 
       const { getTicketDetails } = await loadModule();
-      const result = await getTicketDetails("reg_1", "staff");
+      const result = await getTicketDetails("reg_1", "staff", "STAFF");
 
       expect(result.id).toBe("reg_1");
+      expect(result.qr.token).toBeNull();
+      expect(qrService.recoverRawToken).not.toHaveBeenCalled();
       expect(prisma.user.findUnique).not.toHaveBeenCalled();
       expect(prisma.eventStaffAssignment.findUnique).toHaveBeenCalledWith({
         where: { eventId_userId: { eventId: mockEventId, userId: "staff" } },
@@ -362,7 +399,7 @@ describe("TicketType Service (unit)", () => {
       getRegistrationById.mockResolvedValue(registration);
 
       const { getTicketDetails } = await loadModule();
-      await expect(getTicketDetails("reg_1", "staff")).rejects.toThrow(ForbiddenError);
+      await expect(getTicketDetails("reg_1", "staff", "STAFF")).rejects.toThrow(ForbiddenError);
     });
 
     it("throws ForbiddenError for a stranger with no matching user", async () => {
@@ -370,7 +407,7 @@ describe("TicketType Service (unit)", () => {
       getRegistrationById.mockResolvedValue(registration);
 
       const { getTicketDetails } = await loadModule();
-      await expect(getTicketDetails("reg_1", "stranger")).rejects.toThrow(ForbiddenError);
+      await expect(getTicketDetails("reg_1", "stranger", "ATTENDEE")).rejects.toThrow(ForbiddenError);
     });
 
     it("throws ForbiddenError when the user email does not match the attendee", async () => {
@@ -379,14 +416,14 @@ describe("TicketType Service (unit)", () => {
       getRegistrationById.mockResolvedValue(registration);
 
       const { getTicketDetails } = await loadModule();
-      await expect(getTicketDetails("reg_1", "other")).rejects.toThrow(ForbiddenError);
+      await expect(getTicketDetails("reg_1", "other", "ATTENDEE")).rejects.toThrow(ForbiddenError);
     });
 
     it("propagates NotFoundError when the registration is missing", async () => {
       getRegistrationById.mockRejectedValue(new Error("Registration not found"));
 
       const { getTicketDetails } = await loadModule();
-      await expect(getTicketDetails("reg_1", mockUserId)).rejects.toThrow("Registration not found");
+      await expect(getTicketDetails("reg_1", mockUserId, "ORGANIZER")).rejects.toThrow("Registration not found");
     });
   });
 
@@ -543,6 +580,20 @@ describe("TicketType Service (unit)", () => {
       const result = await listMyTickets(mockUserId);
 
       expect(result.tickets[0].checkedIn).toBe(false);
+    });
+
+    it("recovers and returns the scan token so passes survive a device sync", async () => {
+      const qrToken = { id: "qr_1", registrationId: "reg_1", tokenCipher: "cipher", revokedAt: null };
+      prisma.registration.findMany.mockResolvedValue([
+        { ...baseRegistration, checkins: [], qrToken },
+      ]);
+      qrService.recoverRawToken.mockResolvedValue("synced-token");
+
+      const { listMyTickets } = await loadModule();
+      const result = await listMyTickets(mockUserId);
+
+      expect(result.tickets[0].qr.token).toBe("synced-token");
+      expect(qrService.recoverRawToken).toHaveBeenCalledWith(qrToken, expect.objectContaining({ id: "event_1" }));
     });
 
     it("filters out soft-deleted and cancelled events", async () => {

@@ -143,7 +143,7 @@ export async function deleteTicketType(eventId, ticketTypeId, userId, userRole) 
   return true;
 }
 
-export async function getTicketDetails(ticketId, userId) {
+export async function getTicketDetails(ticketId, userId, userRole) {
   const { getRegistrationById } = await import("../registrations/registration.service.js");
   const { qrService } = await import("./qr.service.js");
 
@@ -151,12 +151,14 @@ export async function getTicketDetails(ticketId, userId) {
 
   const event = await prisma.event.findUnique({
     where: { id: registration.eventId },
-    select: { ownerId: true },
+    select: { ownerId: true, endTime: true },
   });
 
   const isOwner = event && event.ownerId === userId;
-  
-  if (!isOwner) {
+  const isAdmin = userRole === constants.ROLES.ADMIN;
+  let canViewToken = isOwner || isAdmin;
+
+  if (!isOwner && !isAdmin) {
     const isStaff = await prisma.eventStaffAssignment.findUnique({
       where: { eventId_userId: { eventId: registration.eventId, userId } },
       select: { active: true },
@@ -167,17 +169,34 @@ export async function getTicketDetails(ticketId, userId) {
       if (!user || user.email.toLowerCase() !== registration.attendeeEmail.toLowerCase()) {
         throw new ForbiddenError(msg.EVENT.UNAUTHORIZED);
       }
+      canViewToken = true;
     }
   }
 
-  // Generate QR data URL
+  // Recover the opaque scan token only for authorized viewers. Staff may view
+  // ticket details but never receive the raw token (owner / ADMIN / holder only).
+  let rawToken = null;
+  if (canViewToken) {
+    const qrToken = await prisma.qrToken.findUnique({
+      where: { registrationId: registration.id },
+    });
+    if (qrToken) {
+      rawToken = await qrService.recoverRawToken(qrToken, event);
+    }
+  }
+
+  // The QR image must encode the raw scan token — never the confirmation code.
   let qrDataUrl = null;
-  if (registration.ticketCode?.code) {
-    const qrBuffer = await qrService.createQrImage(registration.ticketCode.code);
+  if (rawToken) {
+    const qrBuffer = await qrService.createQrImage(rawToken);
     qrDataUrl = `data:image/png;base64,${qrBuffer.toString("base64")}`;
   }
 
-  return { ...registration, qrDataUrl };
+  return {
+    ...registration,
+    qr: { token: rawToken, image: qrDataUrl },
+    qrDataUrl,
+  };
 }
 
 export async function listEventTickets(eventId, userId, userRole, filters = {}) {
@@ -293,27 +312,41 @@ export async function listMyTickets(userId, page = 1, limit = 20) {
         },
         ticketType: { select: { id: true, name: true, price: true } },
         ticketCode: { select: { code: true } },
+        qrToken: true,
         checkins: { where: { deletedAt: null }, select: { id: true, scannedAt: true, result: true } },
       },
     }),
     prisma.registration.count({ where }),
   ]);
 
-  const tickets = registrations.map((registration) => ({
-    id: registration.id,
-    attendeeName: registration.attendeeName,
-    attendeeEmail: registration.attendeeEmail,
-    status: registration.status,
-    paymentStatus: registration.paymentStatus,
-    confirmationCode: registration.confirmationCode,
-    ticketType: registration.ticketType,
-    ticketCode: registration.ticketCode?.code ?? null,
-    checkedIn: registration.checkins.some(
-      (checkin) => checkin.result === constants.CHECKIN_RESULT.VALID
-    ),
-    event: registration.event,
-    createdAt: registration.createdAt,
-  }));
+  const { qrService } = await import("./qr.service.js");
+
+  const tickets = [];
+  for (const registration of registrations) {
+    // Recover the opaque scan token so passes survive a device Sync. Revoked
+    // (already checked-in) tickets yield no token and never get rotated.
+    let scanToken = null;
+    if (registration.qrToken) {
+      scanToken = await qrService.recoverRawToken(registration.qrToken, registration.event);
+    }
+
+    tickets.push({
+      id: registration.id,
+      attendeeName: registration.attendeeName,
+      attendeeEmail: registration.attendeeEmail,
+      status: registration.status,
+      paymentStatus: registration.paymentStatus,
+      confirmationCode: registration.confirmationCode,
+      ticketType: registration.ticketType,
+      ticketCode: registration.ticketCode?.code ?? null,
+      qr: { token: scanToken, image: null },
+      checkedIn: registration.checkins.some(
+        (checkin) => checkin.result === constants.CHECKIN_RESULT.VALID
+      ),
+      event: registration.event,
+      createdAt: registration.createdAt,
+    });
+  }
 
   return {
     tickets,

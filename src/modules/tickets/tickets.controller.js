@@ -59,7 +59,7 @@ export const getTicketController = async (req, res, next) => {
   try {
     const { ticketId } = req.params;
     const userId = req.user.sub;
-    const ticket = await getTicketDetails(ticketId, userId);
+    const ticket = await getTicketDetails(ticketId, userId, req.user.role);
     return success(res, ticket);
   } catch (error) {
     next(error);
@@ -121,7 +121,7 @@ export const downloadTicketPdfController = async (req, res, next) => {
     const { ticketId } = req.params;
     const userId = req.user.sub;
 
-    const ticket = await getTicketDetails(ticketId, userId);
+    const ticket = await getTicketDetails(ticketId, userId, req.user.role);
     const { generateIndividualTicketPdf } = await import("./ticket-pdf.service.js");
 
     const pdfBuffer = await generateIndividualTicketPdf(ticket, ticket.qrDataUrl);

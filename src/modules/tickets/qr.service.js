@@ -1,26 +1,30 @@
 import { randomBytes } from "crypto";
 import QRCode from "qrcode";
 import prisma from "../../database/index.js";
-import { hashToken } from "../../utils/crypto.js";
+import { hashToken, encryptQrToken, decryptQrToken } from "../../utils/crypto.js";
 import { NotFoundError } from "../../utils/error.js";
-import { systemMessages, constants } from "../../config/index.js";
+import { systemMessages, constants, logger } from "../../config/index.js";
 
 const msg = systemMessages.ERROR;
 const QR_MIN_SIZE = 200;
 const QR_MAX_SIZE = constants.QR.MAX_SIZE;
+const REISSUE_WINDOW_HOURS = 24;
 
 /**
  * QR Token
  *
  * Tokens are opaque 64-char hex strings generated via `crypto.randomBytes(32)`.
- * Only the SHA-256 hash is stored in the database. Expiration is enforced
- * against the `QrToken.expiresAt` column (set to `event.endTime + 24h` at
- * issuance time). The raw token is delivered to the attendee and never persisted.
+ * Only the SHA-256 hash is stored in the database, plus an AES-256-GCM
+ * encryption of the raw token (`tokenCipher`) so the scan token can be
+ * recovered later for authorized callers. Expiration is enforced against the
+ * `QrToken.expiresAt` column (set to `event.endTime + 24h` at issuance time).
+ * The raw token is delivered to the attendee and never stored in plaintext.
  *
  * @typedef {Object} QrTokenRecord
  * @property {string} id
  * @property {string} registrationId
  * @property {string} tokenHash - SHA-256 hex digest of the raw token
+ * @property {string|null} tokenCipher - AES-256-GCM ciphertext of the raw token
  * @property {Date} issuedAt
  * @property {Date} expiresAt - event.endTime + 24h
  * @property {Date|null} revokedAt
@@ -43,12 +47,14 @@ class QrService {
   async generateToken(registrationId, expiresAt) {
     const rawToken = randomBytes(32).toString("hex");
     const tokenHash = hashToken(rawToken);
+    const tokenCipher = encryptQrToken(rawToken);
 
     try {
       await prisma.qrToken.create({
         data: {
           registrationId,
           tokenHash,
+          tokenCipher,
           expiresAt,
         },
       });
@@ -58,6 +64,55 @@ class QrService {
       }
       throw err;
     }
+
+    return rawToken;
+  }
+
+  /**
+   * Recover the raw QR token for a stored QrToken record.
+   *
+   * Tokens issued after the `tokenCipher` column shipped are decrypted and
+   * returned as-is. Legacy tokens (issued before encryption, `tokenCipher`
+   * null) cannot be recovered, so they are rotated once: a new random token
+   * replaces the stored hash/cipher and the raw value is returned. Rotation is
+   * skipped for revoked tokens — a checked-in pass must never gain a fresh
+   * scanable token — in which case `null` is returned.
+   *
+   * @param {Object} qrToken - QrToken record (needs `id`, `registrationId`, `tokenCipher`, `revokedAt`)
+   * @param {Object} [event] - Event record whose `endTime` drives the new expiry on rotation
+   * @returns {Promise<string|null>} The raw scan token, or null if unavailable
+   */
+  async recoverRawToken(qrToken, event) {
+    if (!qrToken) {
+      return null;
+    }
+
+    if (qrToken.tokenCipher) {
+      try {
+        return decryptQrToken(qrToken.tokenCipher);
+      } catch (err) {
+        logger.warn(
+          { err: err.message, registrationId: qrToken.registrationId },
+          'QR token cipher could not be decrypted; rotating token'
+        );
+      }
+    }
+
+    if (qrToken?.revokedAt) {
+      return null;
+    }
+
+    const rawToken = randomBytes(32).toString("hex");
+    const tokenHash = hashToken(rawToken);
+    const tokenCipher = encryptQrToken(rawToken);
+    const expiresAt = event?.endTime
+      ? new Date(new Date(event.endTime).getTime() + REISSUE_WINDOW_HOURS * 60 * 60 * 1000)
+      : new Date(Date.now() + REISSUE_WINDOW_HOURS * 60 * 60 * 1000);
+
+    await prisma.qrToken.update({
+      where: { id: qrToken.id },
+      data: { tokenHash, tokenCipher, expiresAt },
+    });
 
     return rawToken;
   }

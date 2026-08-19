@@ -94,10 +94,16 @@ export async function generateTicketPdf(ticketId, userId) {
   const qrRecord = registration.qrToken;
   if (qrRecord) {
     try {
-      const qrBuffer = await qrService.createQrImage(qrRecord.tokenHash, { width: 150 });
-      const centerX = (doc.page.width - 150) / 2;
-      doc.image(qrBuffer, centerX, doc.y, { width: 150, height: 150 });
-      doc.moveDown(5);
+      const rawToken = await qrService.recoverRawToken(qrRecord, registration.event);
+      if (rawToken) {
+        const qrBuffer = await qrService.createQrImage(rawToken, { width: 150 });
+        const centerX = (doc.page.width - 150) / 2;
+        doc.image(qrBuffer, centerX, doc.y, { width: 150, height: 150 });
+        doc.moveDown(5);
+      } else {
+        doc.fontSize(10).font('Helvetica').text('QR code unavailable for this ticket', { align: 'center' });
+        doc.moveDown(1);
+      }
     } catch {
       doc.fontSize(10).font('Helvetica').text('QR code unavailable for this ticket', { align: 'center' });
       doc.moveDown(1);

@@ -11,6 +11,7 @@ vi.mock("../../../database/index.js", () => ({
     qrToken: {
       findUnique: vi.fn(),
       create: vi.fn(),
+      update: vi.fn(),
     },
   },
 }));
@@ -18,6 +19,7 @@ vi.mock("../../../database/index.js", () => ({
 import { qrService } from "../qr.service.js";
 import prisma from "../../../database/index.js";
 import QRCode from "qrcode";
+import { hashToken } from "../../../utils/crypto.js";
 
 describe("QrService", () => {
   beforeEach(() => {
@@ -37,6 +39,7 @@ describe("QrService", () => {
         data: {
           registrationId: "reg-1",
           tokenHash: expect.any(String),
+          tokenCipher: expect.any(String),
           expiresAt,
         },
       });
@@ -63,6 +66,65 @@ describe("QrService", () => {
       await expect(
         qrService.generateToken("reg-1", new Date())
       ).rejects.toThrow("DB timeout");
+    });
+  });
+
+  describe("recoverRawToken", () => {
+    const event = { endTime: new Date("2026-08-10T00:00:00Z") };
+
+    it("should return the null when no record exists", async () => {
+      const token = await qrService.recoverRawToken(null, event);
+      expect(token).toBeNull();
+    });
+
+    it("should decrypt and return the stored raw token when a cipher exists", async () => {
+      const rawToken = "a".repeat(64);
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: encryptQrToken(rawToken),
+        revokedAt: null,
+      };
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+      expect(token).toBe(rawToken);
+      expect(prisma.qrToken.update).not.toHaveBeenCalled();
+    });
+
+    it("should rotate a legacy token (no cipher) and persist the new hash and cipher", async () => {
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: null,
+      };
+      prisma.qrToken.update.mockResolvedValue({});
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      expect(prisma.qrToken.update).toHaveBeenCalledWith({
+        where: { id: "qr-1" },
+        data: {
+          tokenHash: hashToken(token),
+          tokenCipher: expect.any(String),
+          expiresAt: new Date("2026-08-11T00:00:00Z"),
+        },
+      });
+    });
+
+    it("should not rotate a revoked legacy token and return null", async () => {
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: new Date(),
+      };
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+      expect(token).toBeNull();
+      expect(prisma.qrToken.update).not.toHaveBeenCalled();
     });
   });
 
