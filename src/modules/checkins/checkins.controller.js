@@ -41,3 +41,18 @@ export async function getCheckinStatistics(req, res, next) {
     next(err);
   }
 }
+
+export async function listEventAttendees(req, res, next) {
+  try {
+    const result = await checkinService.listEventAttendees(
+      req.params.eventId,
+      req.user.sub,
+      req.user.role,
+      req.query
+    );
+
+    return success(res, result);
+  } catch (err) {
+    next(err);
+  }
+}

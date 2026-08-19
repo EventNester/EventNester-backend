@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { scanQr, getCheckins, undoCheckin, getCheckinStatistics } from "../checkins.service.js";
+import { scanQr, getCheckins, undoCheckin, getCheckinStatistics, listEventAttendees } from "../checkins.service.js";
 import prisma from "../../../database/index.js";
 import { ConflictError, NotFoundError, ForbiddenError, BadRequestError } from "../../../utils/error.js";
 import { constants, systemMessages, logger } from "../../../config/index.js";
@@ -24,6 +24,9 @@ vi.mock("../../../database/index.js", () => ({
       findUnique: vi.fn(),
     },
     registration: {
+      findUnique: vi.fn(),
+      findMany: vi.fn(),
+      count: vi.fn(),
       update: vi.fn(),
     },
     qrToken: {
@@ -127,6 +130,9 @@ describe("Checkin Service Tests", () => {
     prisma.$transaction.mockImplementation(async (fn) => fn(mTx));
     prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
     prisma.eventStaffAssignment.findUnique.mockResolvedValue({ active: true });
+    prisma.registration.findUnique.mockResolvedValue(null);
+    prisma.registration.findMany.mockResolvedValue([]);
+    prisma.registration.count.mockResolvedValue(0);
     prisma.checkIn.count.mockResolvedValue(1);
   });
 
@@ -238,6 +244,70 @@ describe("Checkin Service Tests", () => {
         mockEventId,
         expect.objectContaining({ result: constants.CHECKIN_RESULT.INVALID, message: errMsg.CHECKIN.INVALID_QR })
       );
+    });
+
+    test("should allow a manual check-in using an opaque registration id token", async () => {
+      mRedisClient.set.mockResolvedValue("OK");
+      prisma.qrToken.findUnique.mockResolvedValue(null);
+      prisma.registration.findUnique.mockResolvedValue({
+        id: mockRegistrationId,
+        eventId: mockEventId,
+        status: "CONFIRMED",
+        attendeeName: "John Doe",
+      });
+      prisma.checkIn.findUnique.mockResolvedValue(null);
+      mTx.checkIn.create.mockResolvedValue(mockCheckin);
+
+      const result = await scanQr(mockEventId, { token: mockRegistrationId }, mockStaffId);
+
+      expect(result.result).toBe(constants.CHECKIN_RESULT.VALID);
+      expect(result.attendeeName).toBe("John Doe");
+      expect(result.checkinId).toBe(mockCheckInId);
+      expect(mTx.checkIn.create).toHaveBeenCalledWith({
+        data: {
+          eventId: mockEventId,
+          registrationId: mockRegistrationId,
+          staffId: mockStaffId,
+          result: constants.CHECKIN_RESULT.VALID,
+          deviceInfo: undefined,
+        },
+        include: { registration: true },
+      });
+      expect(mTx.qrToken.update).not.toHaveBeenCalled();
+    });
+
+    test("should return INVALID for a manual check-in token of a different event", async () => {
+      mRedisClient.set.mockResolvedValue("OK");
+      prisma.qrToken.findUnique.mockResolvedValue(null);
+      prisma.registration.findUnique.mockResolvedValue({
+        id: "reg-other",
+        eventId: "other_event",
+        status: "CONFIRMED",
+        attendeeName: "Someone Else",
+      });
+
+      const result = await scanQr(mockEventId, { token: "reg-other" }, mockStaffId);
+
+      expect(result.result).toBe(constants.CHECKIN_RESULT.INVALID);
+      expect(result.message).toBe(errMsg.CHECKIN.INVALID_QR);
+      expect(mTx.checkIn.create).not.toHaveBeenCalled();
+    });
+
+    test("should return INVALID when the manual check-in registration is not confirmed", async () => {
+      mRedisClient.set.mockResolvedValue("OK");
+      prisma.qrToken.findUnique.mockResolvedValue(null);
+      prisma.registration.findUnique.mockResolvedValue({
+        id: mockRegistrationId,
+        eventId: mockEventId,
+        status: "PENDING",
+        attendeeName: "John Doe",
+      });
+
+      const result = await scanQr(mockEventId, { token: mockRegistrationId }, mockStaffId);
+
+      expect(result.result).toBe(constants.CHECKIN_RESULT.INVALID);
+      expect(result.message).toBe(errMsg.CHECKIN.REGISTRATION_NOT_CONFIRMED);
+      expect(mTx.checkIn.create).not.toHaveBeenCalled();
     });
 
     test("should return EXPIRED if QR token expired", async () => {
@@ -688,6 +758,171 @@ describe("Checkin Service Tests", () => {
       expect(result.checkins.duplicate).toBe(0);
       expect(result.uniqueAttendeesCheckedIn).toBe(1);
       expect(prisma.eventStaffAssignment.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("listEventAttendees", () => {
+    const mockRegistrations = [
+      {
+        id: "reg_1",
+        eventId: mockEventId,
+        attendeeName: "Ada Lovelace",
+        attendeeEmail: "ada@example.com",
+        phone: "+2348000000000",
+        confirmationCode: "QPC-ADA123",
+        ticketCode: { code: "EVNT-ABC1" },
+        ticketType: { id: "tt_1", name: "VIP" },
+        status: "CONFIRMED",
+        paymentStatus: "SUCCESS",
+        qrIssued: true,
+        qrToken: { id: "qr_1", revokedAt: null, expiresAt: new Date("2099-01-01T00:00:00Z") },
+        checkins: [{ id: "checkin_1", result: constants.CHECKIN_RESULT.VALID, scannedAt: new Date() }],
+      },
+      {
+        id: "reg_2",
+        eventId: mockEventId,
+        attendeeName: "Bob Builder",
+        attendeeEmail: "bob@example.com",
+        phone: null,
+        confirmationCode: "QPC-BOB123",
+        ticketCode: { code: "EVNT-BOB1" },
+        ticketType: null,
+        status: "CONFIRMED",
+        paymentStatus: "PENDING",
+        qrIssued: false,
+        qrToken: null,
+        checkins: [],
+      },
+    ];
+
+    test("should allow the event owner to list attendees", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.registration.findMany.mockResolvedValue(mockRegistrations);
+      prisma.registration.count.mockResolvedValue(2);
+
+      const result = await listEventAttendees(mockEventId, mockOwnerId, "ORGANIZER", {});
+
+      expect(result.attendees).toHaveLength(2);
+      expect(result.attendees[0]).toEqual(
+        expect.objectContaining({
+          id: "reg_1",
+          attendeeName: "Ada Lovelace",
+          attendeeEmail: "ada@example.com",
+          phone: "+2348000000000",
+          confirmationCode: "QPC-ADA123",
+          ticketCode: "EVNT-ABC1",
+          status: "CONFIRMED",
+          checkedIn: true,
+          qr: { token: "reg_1", issued: true },
+        })
+      );
+      expect(result.attendees[1].checkedIn).toBe(false);
+      expect(result.attendees[1].qr.issued).toBe(false);
+      expect(result.pagination).toEqual({ page: 1, limit: 20, total: 2, totalPages: 1 });
+      expect(prisma.eventStaffAssignment.findUnique).not.toHaveBeenCalled();
+    });
+
+    test("should allow an active assigned staff member to list attendees", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.eventStaffAssignment.findUnique.mockResolvedValue({ active: true });
+      prisma.registration.findMany.mockResolvedValue(mockRegistrations);
+      prisma.registration.count.mockResolvedValue(2);
+
+      const result = await listEventAttendees(mockEventId, mockStaffId, "STAFF", {});
+
+      expect(result.attendees).toHaveLength(2);
+      expect(prisma.eventStaffAssignment.findUnique).toHaveBeenCalledWith({
+        where: { eventId_userId: { eventId: mockEventId, userId: mockStaffId } },
+        select: { active: true },
+      });
+    });
+
+    test("should allow an ADMIN to list attendees without an assignment", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.eventStaffAssignment.findUnique.mockResolvedValue(null);
+      prisma.registration.findMany.mockResolvedValue(mockRegistrations);
+      prisma.registration.count.mockResolvedValue(2);
+
+      const result = await listEventAttendees(mockEventId, mockStaffId, "ADMIN", {});
+
+      expect(result.attendees).toHaveLength(2);
+      expect(prisma.eventStaffAssignment.findUnique).not.toHaveBeenCalled();
+    });
+
+    test("should throw ForbiddenError for a user who is not the owner nor assigned staff", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.eventStaffAssignment.findUnique.mockResolvedValue(null);
+
+      await expect(listEventAttendees(mockEventId, mockStaffId, "STAFF", {}))
+        .rejects.toThrow(ForbiddenError);
+      await expect(listEventAttendees(mockEventId, mockStaffId, "STAFF", {}))
+        .rejects.toThrow(errMsg.CHECKIN.NOT_AUTHORIZED);
+    });
+
+    test("should throw ForbiddenError for an inactive staff assignment", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.eventStaffAssignment.findUnique.mockResolvedValue({ active: false });
+
+      await expect(listEventAttendees(mockEventId, mockStaffId, "STAFF", {}))
+        .rejects.toThrow(ForbiddenError);
+    });
+
+    test("should throw NotFoundError if the event does not exist", async () => {
+      prisma.event.findFirst.mockResolvedValue(null);
+
+      await expect(listEventAttendees(mockEventId, mockOwnerId, "ORGANIZER", {}))
+        .rejects.toThrow(NotFoundError);
+      await expect(listEventAttendees(mockEventId, mockOwnerId, "ORGANIZER", {}))
+        .rejects.toThrow(errMsg.EVENT.NOT_FOUND);
+    });
+
+    test("should apply search across name, email, phone, and confirmation code", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.registration.findMany.mockResolvedValue([mockRegistrations[0]]);
+      prisma.registration.count.mockResolvedValue(1);
+
+      await listEventAttendees(mockEventId, mockOwnerId, "ORGANIZER", { q: "Ada", page: 2, limit: 10, status: "CONFIRMED" });
+
+      expect(prisma.registration.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            eventId: mockEventId,
+            status: "CONFIRMED",
+            OR: [
+              { attendeeName: { contains: "Ada", mode: "insensitive" } },
+              { attendeeEmail: { contains: "Ada", mode: "insensitive" } },
+              { phone: { contains: "Ada", mode: "insensitive" } },
+              { confirmationCode: { contains: "Ada", mode: "insensitive" } },
+            ],
+          },
+          skip: 10,
+          take: 10,
+        })
+      );
+      expect(prisma.registration.count).toHaveBeenCalledWith({
+        where: {
+          eventId: mockEventId,
+          status: "CONFIRMED",
+          OR: [
+            { attendeeName: { contains: "Ada", mode: "insensitive" } },
+            { attendeeEmail: { contains: "Ada", mode: "insensitive" } },
+            { phone: { contains: "Ada", mode: "insensitive" } },
+            { confirmationCode: { contains: "Ada", mode: "insensitive" } },
+          ],
+        },
+      });
+    });
+
+    test("should ignore a blank search term", async () => {
+      prisma.event.findFirst.mockResolvedValue({ ownerId: mockOwnerId });
+      prisma.registration.findMany.mockResolvedValue(mockRegistrations);
+      prisma.registration.count.mockResolvedValue(2);
+
+      await listEventAttendees(mockEventId, mockOwnerId, "ORGANIZER", { q: "   " });
+
+      expect(prisma.registration.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { eventId: mockEventId } })
+      );
     });
   });
 });
