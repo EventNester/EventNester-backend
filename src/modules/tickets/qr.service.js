@@ -75,8 +75,10 @@ class QrService {
    * returned as-is. Legacy tokens (issued before encryption, `tokenCipher`
    * null) cannot be recovered, so they are rotated once: a new random token
    * replaces the stored hash/cipher and the raw value is returned. Rotation is
-   * skipped for revoked tokens — a checked-in pass must never gain a fresh
-   * scanable token — in which case `null` is returned.
+   * concurrency-safe (a conditional update wins only if the token was not
+   * rotated or revoked since it was read; losers reload and return the
+   * winner's token) and is skipped for revoked tokens — a checked-in pass must
+   * never gain a fresh scanable token — in which case `null` is returned.
    *
    * @param {Object} qrToken - QrToken record (needs `id`, `registrationId`, `tokenCipher`, `revokedAt`)
    * @param {Object} [event] - Event record whose `endTime` drives the new expiry on rotation
@@ -89,7 +91,14 @@ class QrService {
 
     if (qrToken.tokenCipher) {
       try {
-        return decryptQrToken(qrToken.tokenCipher);
+        const rawToken = decryptQrToken(qrToken.tokenCipher);
+        if (hashToken(rawToken) === qrToken.tokenHash) {
+          return rawToken;
+        }
+        logger.warn(
+          { registrationId: qrToken.registrationId },
+          "QR token cipher does not match the stored hash; rotating token"
+        );
       } catch (err) {
         logger.warn(
           { err: err.message, registrationId: qrToken.registrationId },
@@ -109,12 +118,45 @@ class QrService {
       ? new Date(new Date(event.endTime).getTime() + REISSUE_WINDOW_HOURS * 60 * 60 * 1000)
       : new Date(Date.now() + REISSUE_WINDOW_HOURS * 60 * 60 * 1000);
 
-    await prisma.qrToken.update({
-      where: { id: qrToken.id },
+    // Conditional update lets only the caller whose observed state still holds
+    // replace the legacy token; a concurrent rotation or revocation matches no
+    // rows, so at most one reader mints the new token.
+    const result = await prisma.qrToken.updateMany({
+      where: {
+        id: qrToken.id,
+        tokenCipher: qrToken.tokenCipher ?? null,
+        revokedAt: null,
+      },
       data: { tokenHash, tokenCipher, expiresAt },
     });
 
-    return rawToken;
+    if (result.count === 1) {
+      return rawToken;
+    }
+
+    // Lost the race — another caller already rotated the token (or it was
+    // revoked). Reload and return the winning token so all callers converge
+    // on the same QR, unless the pass was revoked.
+    const latest = await prisma.qrToken.findUnique({ where: { id: qrToken.id } });
+    if (!latest || latest.revokedAt || !latest.tokenCipher) {
+      return null;
+    }
+    try {
+      const winningToken = decryptQrToken(latest.tokenCipher);
+      if (hashToken(winningToken) === latest.tokenHash) {
+        return winningToken;
+      }
+      logger.warn(
+        { registrationId: latest.registrationId },
+        "QR token cipher does not match the stored hash after concurrent rotation"
+      );
+    } catch (err) {
+      logger.warn(
+        { err: err.message, registrationId: latest.registrationId },
+        "QR token cipher could not be decrypted after concurrent rotation"
+      );
+    }
+    return null;
   }
 
   /**

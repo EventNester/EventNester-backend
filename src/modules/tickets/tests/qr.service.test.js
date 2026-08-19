@@ -12,6 +12,7 @@ vi.mock("../../../database/index.js", () => ({
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      updateMany: vi.fn(),
     },
   },
 }));
@@ -83,13 +84,39 @@ describe("QrService", () => {
       const qrToken = {
         id: "qr-1",
         registrationId: "reg-1",
+        tokenHash: hashToken(rawToken),
         tokenCipher: encryptQrToken(rawToken),
         revokedAt: null,
       };
 
       const token = await qrService.recoverRawToken(qrToken, event);
       expect(token).toBe(rawToken);
-      expect(prisma.qrToken.update).not.toHaveBeenCalled();
+      expect(prisma.qrToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("should rotate a token whose cipher does not match the stored hash", async () => {
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const badCipher = encryptQrToken("a".repeat(64));
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenHash: hashToken("b".repeat(64)),
+        tokenCipher: badCipher,
+        revokedAt: null,
+      };
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 1 });
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "qr-1", tokenCipher: badCipher, revokedAt: null },
+        data: {
+          tokenHash: hashToken(token),
+          tokenCipher: expect.any(String),
+          expiresAt: expect.any(Date),
+        },
+      });
     });
 
     it("should rotate a legacy token (no cipher) and persist the new hash and cipher", async () => {
@@ -99,13 +126,13 @@ describe("QrService", () => {
         tokenCipher: null,
         revokedAt: null,
       };
-      prisma.qrToken.update.mockResolvedValue({});
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 1 });
 
       const token = await qrService.recoverRawToken(qrToken, event);
 
       expect(token).toMatch(/^[0-9a-f]{64}$/);
-      expect(prisma.qrToken.update).toHaveBeenCalledWith({
-        where: { id: "qr-1" },
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "qr-1", tokenCipher: null, revokedAt: null },
         data: {
           tokenHash: hashToken(token),
           tokenCipher: expect.any(String),
@@ -124,7 +151,46 @@ describe("QrService", () => {
 
       const token = await qrService.recoverRawToken(qrToken, event);
       expect(token).toBeNull();
-      expect(prisma.qrToken.update).not.toHaveBeenCalled();
+      expect(prisma.qrToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("should return the winning token when a concurrent rotation wins the race", async () => {
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const winningRawToken = "c".repeat(64);
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.qrToken.findUnique.mockResolvedValue({
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenHash: hashToken(winningRawToken),
+        tokenCipher: encryptQrToken(winningRawToken),
+        revokedAt: null,
+      });
+
+      const token = await qrService.recoverRawToken(
+        { id: "qr-1", registrationId: "reg-1", tokenCipher: null, revokedAt: null },
+        event
+      );
+
+      expect(token).toBe(winningRawToken);
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.qrToken.findUnique).toHaveBeenCalledWith({ where: { id: "qr-1" } });
+    });
+
+    it("should return null when the winning token was revoked during the race", async () => {
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.qrToken.findUnique.mockResolvedValue({
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: new Date(),
+      });
+
+      const token = await qrService.recoverRawToken(
+        { id: "qr-1", registrationId: "reg-1", tokenCipher: null, revokedAt: null },
+        event
+      );
+
+      expect(token).toBeNull();
     });
   });
 

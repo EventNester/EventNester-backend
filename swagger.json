@@ -952,10 +952,12 @@
             "properties": {
               "token": {
                 "type": "string",
+                "nullable": true,
                 "description": "Raw opaque QR scan token (64-char hex). Null when unavailable (e.g. already checked-in legacy pass)."
               },
               "image": {
                 "type": "string",
+                "nullable": true,
                 "description": "Base64 PNG data URL encoding qr.token. Null when token is unavailable."
               }
             }
