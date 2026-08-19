@@ -10,6 +10,7 @@ import { emitCheckinUpdate, emitScanResult } from "../../realtime/rooms.js";
 const errMsg = systemMessages.ERROR;
 const successMsg = systemMessages.SUCCESS;
 const HOURS_24_MS = 24 * 60 * 60 * 1000;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function scanQr(eventId, data, staffId) {
   const redis = getRedisClient();
@@ -56,27 +57,33 @@ export async function scanQr(eventId, data, staffId) {
       // returned by the attendee lookup (GET /checkins/:eventId/attendees),
       // used to check in someone whose QR cannot be scanned (e.g. camera
       // failure). Identity is verified by the staff member at the gate.
-      const manualRegistration = await prisma.registration.findUnique({
-        where: { id: data.token },
-        select: { id: true, eventId: true, status: true, attendeeName: true },
-      });
-
-      if (!manualRegistration || manualRegistration.eventId !== eventId) {
+      // Only registration UUIDs are valid manual lookup keys; any other
+      // token is an invalid scan and never hits the database.
+      if (!UUID_REGEX.test(data.token)) {
         scanResult = { result: constants.CHECKIN_RESULT.INVALID, message: errMsg.CHECKIN.INVALID_QR };
-      } else if (manualRegistration.status !== "CONFIRMED") {
-        attendeeName = manualRegistration.attendeeName;
-        scanResult = { result: constants.CHECKIN_RESULT.INVALID, message: errMsg.CHECKIN.REGISTRATION_NOT_CONFIRMED };
       } else {
-        const resolved = await resolveCheckIn({
-          eventId,
-          registrationId: manualRegistration.id,
-          staffId,
-          deviceInfo: data.deviceInfo,
-          tokenHash,
-          qrTokenId: null,
+        const manualRegistration = await prisma.registration.findUnique({
+          where: { id: data.token },
+          select: { id: true, eventId: true, status: true, attendeeName: true },
         });
-        attendeeName = resolved.attendeeName;
-        scanResult = resolved.scanResult;
+
+        if (!manualRegistration || manualRegistration.eventId !== eventId) {
+          scanResult = { result: constants.CHECKIN_RESULT.INVALID, message: errMsg.CHECKIN.INVALID_QR };
+        } else if (manualRegistration.status !== "CONFIRMED") {
+          attendeeName = manualRegistration.attendeeName;
+          scanResult = { result: constants.CHECKIN_RESULT.INVALID, message: errMsg.CHECKIN.REGISTRATION_NOT_CONFIRMED };
+        } else {
+          const resolved = await resolveCheckIn({
+            eventId,
+            registrationId: manualRegistration.id,
+            staffId,
+            deviceInfo: data.deviceInfo,
+            tokenHash,
+            qrTokenId: null,
+          });
+          attendeeName = resolved.attendeeName;
+          scanResult = resolved.scanResult;
+        }
       }
     } else if (new Date(qrToken.expiresAt) < new Date()) {
       attendeeName = qrToken.registration.attendeeName;
@@ -157,6 +164,7 @@ export async function scanQr(eventId, data, staffId) {
 async function resolveCheckIn({ eventId, registrationId, staffId, deviceInfo, tokenHash, qrTokenId }) {
   const existingCheckin = await prisma.checkIn.findUnique({
     where: { eventId_registrationId: { eventId, registrationId } },
+    include: { registration: { select: { attendeeName: true } } },
   });
 
   if (existingCheckin && !existingCheckin.deletedAt) {
@@ -174,7 +182,6 @@ async function resolveCheckIn({ eventId, registrationId, staffId, deviceInfo, to
       scanResult: { result: constants.CHECKIN_RESULT.DUPLICATE, message: errMsg.CHECKIN.DUPLICATE },
     };
   }
-
   if (existingCheckin) {
     const restored = await prisma.$transaction(async (tx) => {
       const checkin = await tx.checkIn.update({
@@ -351,10 +358,20 @@ export async function undoCheckin(eventId, checkInId, staffId) {
       data: { status: "CONFIRMED" },
     });
 
-    await tx.qrToken.update({
+    // Reverse the QR-token state only for QR-backed check-ins. A manual
+    // check-in (resolveCheckIn with qrTokenId: null) never incremented
+    // scanCount or revoked the token, so undoing one must not touch the QR
+    // token; registrations without a QR token are skipped as well.
+    const qrToken = await tx.qrToken.findUnique({
       where: { registrationId: checkin.registrationId },
-      data: { revokedAt: null, scanCount: { decrement: 1 } },
+      select: { id: true, revokedAt: true },
     });
+    if (qrToken?.revokedAt) {
+      await tx.qrToken.update({
+        where: { id: qrToken.id },
+        data: { revokedAt: null, scanCount: { decrement: 1 } },
+      });
+    }
   });
 
   return { success: true };

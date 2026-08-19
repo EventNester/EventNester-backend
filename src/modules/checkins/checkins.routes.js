@@ -275,6 +275,12 @@ router.get("/:eventId/checkins", requireAuth, requireRole("STAFF", "ORGANIZER"),
  *                               phone: { type: string, nullable: true }
  *                               confirmationCode: { type: string, nullable: true }
  *                               ticketCode: { type: string, nullable: true }
+ *                               ticketType:
+ *                                 type: object
+ *                                 nullable: true
+ *                                 properties:
+ *                                   id: { type: string }
+ *                                   name: { type: string }
  *                               status: { type: string }
  *                               paymentStatus: { type: string }
  *                               checkedIn: { type: boolean }
