@@ -254,7 +254,7 @@ async function issueQrToken(registrationId, event) {
 
   const existing = await prisma.qrToken.findUnique({ where: { registrationId } });
   const rawToken = existing
-    ? existing.tokenHash
+    ? await qrService.recoverRawToken(existing, event)
     : await qrService.generateToken(registrationId, expiresAt);
 
   await prisma.registration.update({

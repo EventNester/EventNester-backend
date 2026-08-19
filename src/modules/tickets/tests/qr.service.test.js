@@ -11,6 +11,8 @@ vi.mock("../../../database/index.js", () => ({
     qrToken: {
       findUnique: vi.fn(),
       create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
     },
   },
 }));
@@ -18,6 +20,7 @@ vi.mock("../../../database/index.js", () => ({
 import { qrService } from "../qr.service.js";
 import prisma from "../../../database/index.js";
 import QRCode from "qrcode";
+import { hashToken } from "../../../utils/crypto.js";
 
 describe("QrService", () => {
   beforeEach(() => {
@@ -37,6 +40,7 @@ describe("QrService", () => {
         data: {
           registrationId: "reg-1",
           tokenHash: expect.any(String),
+          tokenCipher: expect.any(String),
           expiresAt,
         },
       });
@@ -63,6 +67,130 @@ describe("QrService", () => {
       await expect(
         qrService.generateToken("reg-1", new Date())
       ).rejects.toThrow("DB timeout");
+    });
+  });
+
+  describe("recoverRawToken", () => {
+    const event = { endTime: new Date("2026-08-10T00:00:00Z") };
+
+    it("should return the null when no record exists", async () => {
+      const token = await qrService.recoverRawToken(null, event);
+      expect(token).toBeNull();
+    });
+
+    it("should decrypt and return the stored raw token when a cipher exists", async () => {
+      const rawToken = "a".repeat(64);
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenHash: hashToken(rawToken),
+        tokenCipher: encryptQrToken(rawToken),
+        revokedAt: null,
+      };
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+      expect(token).toBe(rawToken);
+      expect(prisma.qrToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("should rotate a token whose cipher does not match the stored hash", async () => {
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const badCipher = encryptQrToken("a".repeat(64));
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenHash: hashToken("b".repeat(64)),
+        tokenCipher: badCipher,
+        revokedAt: null,
+      };
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 1 });
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "qr-1", tokenCipher: badCipher, revokedAt: null },
+        data: {
+          tokenHash: hashToken(token),
+          tokenCipher: expect.any(String),
+          expiresAt: expect.any(Date),
+        },
+      });
+    });
+
+    it("should rotate a legacy token (no cipher) and persist the new hash and cipher", async () => {
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: null,
+      };
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 1 });
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+
+      expect(token).toMatch(/^[0-9a-f]{64}$/);
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "qr-1", tokenCipher: null, revokedAt: null },
+        data: {
+          tokenHash: hashToken(token),
+          tokenCipher: expect.any(String),
+          expiresAt: new Date("2026-08-11T00:00:00Z"),
+        },
+      });
+    });
+
+    it("should not rotate a revoked legacy token and return null", async () => {
+      const qrToken = {
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: new Date(),
+      };
+
+      const token = await qrService.recoverRawToken(qrToken, event);
+      expect(token).toBeNull();
+      expect(prisma.qrToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("should return the winning token when a concurrent rotation wins the race", async () => {
+      const { encryptQrToken } = await import("../../../utils/crypto.js");
+      const winningRawToken = "c".repeat(64);
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.qrToken.findUnique.mockResolvedValue({
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenHash: hashToken(winningRawToken),
+        tokenCipher: encryptQrToken(winningRawToken),
+        revokedAt: null,
+      });
+
+      const token = await qrService.recoverRawToken(
+        { id: "qr-1", registrationId: "reg-1", tokenCipher: null, revokedAt: null },
+        event
+      );
+
+      expect(token).toBe(winningRawToken);
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.qrToken.findUnique).toHaveBeenCalledWith({ where: { id: "qr-1" } });
+    });
+
+    it("should return null when the winning token was revoked during the race", async () => {
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.qrToken.findUnique.mockResolvedValue({
+        id: "qr-1",
+        registrationId: "reg-1",
+        tokenCipher: null,
+        revokedAt: new Date(),
+      });
+
+      const token = await qrService.recoverRawToken(
+        { id: "qr-1", registrationId: "reg-1", tokenCipher: null, revokedAt: null },
+        event
+      );
+
+      expect(token).toBeNull();
     });
   });
 
