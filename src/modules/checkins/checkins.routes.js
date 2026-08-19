@@ -8,6 +8,7 @@ import {
   checkinStatsQuerySchema,
   scanEventIdParamsSchema,
   checkinListParamsSchema,
+  attendeeLookupQuerySchema,
   undoCheckinParamsSchema,
 } from "./checkins.schema.js";
 
@@ -206,6 +207,127 @@ router.post("/:eventId/scan", requireAuth, requireRole("STAFF", "ORGANIZER"), va
  *               $ref: '#/components/schemas/ErrorResponse'
  */
 router.get("/:eventId/checkins", requireAuth, requireRole("STAFF", "ORGANIZER"), validateParams(checkinListParamsSchema), checkinController.getCheckins);
+
+/**
+ * @openapi
+ * /api/v1/checkins/{eventId}/attendees:
+ *   get:
+ *     summary: List attendees for manual gate check-in
+ *     description: |
+ *       Returns paginated event attendees with the details gate staff need to
+ *       manually check someone in (name, email, phone, confirmation code,
+ *       ticket code, status, payment status, checked-in flag) plus an opaque
+ *       `qr.token` accepted by `POST /checkins/{eventId}/scan` for a manual
+ *       check-in when the attendee's QR cannot be scanned.
+ *
+ *       Access mirrors the scan + dashboard rule: the event owner, an ADMIN,
+ *       or an active assigned staff member. Unassigned users receive 403.
+ *
+ *       Search by name, email, phone, or confirmation code via the `q` query
+ *       parameter (case-insensitive partial match).
+ *     tags: [Checkins]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: eventId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *         description: Event ID
+ *       - in: query
+ *         name: q
+ *         required: false
+ *         schema: { type: string, maxLength: 255 }
+ *         description: Search by attendee name, email, phone, or confirmation code
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20, maximum: 100 }
+ *         description: Items per page
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [PENDING, CONFIRMED, CANCELLED] }
+ *         description: Filter by registration status
+ *     responses:
+ *       200:
+ *         description: Paginated list of attendees
+ *         content:
+ *           application/json:
+ *             schema:
+ *               allOf:
+ *                 - $ref: '#/components/schemas/SuccessResponse'
+ *                 - type: object
+ *                   properties:
+ *                     data:
+ *                       type: object
+ *                       properties:
+ *                         attendees:
+ *                           type: array
+ *                           items:
+ *                             type: object
+ *                             properties:
+ *                               id: { type: string, description: Registration ID }
+ *                               attendeeName: { type: string }
+ *                               attendeeEmail: { type: string }
+ *                               phone: { type: string, nullable: true }
+ *                               confirmationCode: { type: string, nullable: true }
+ *                               ticketCode: { type: string, nullable: true }
+ *                               ticketType:
+ *                                 type: object
+ *                                 nullable: true
+ *                                 properties:
+ *                                   id: { type: string }
+ *                                   name: { type: string }
+ *                               status: { type: string }
+ *                               paymentStatus: { type: string }
+ *                               checkedIn: { type: boolean }
+ *                               qr:
+ *                                 type: object
+ *                                 properties:
+ *                                   token: { type: string, description: 'Opaque token accepted by POST /checkins/{eventId}/scan for manual check-in' }
+ *                                   issued: { type: boolean }
+ *                         pagination:
+ *                           type: object
+ *                           properties:
+ *                             page: { type: integer }
+ *                             limit: { type: integer }
+ *                             total: { type: integer }
+ *                             totalPages: { type: integer }
+ *       401:
+ *         description: Unauthorized — missing or invalid Bearer token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       403:
+ *         description: Forbidden — requires event ownership or an active staff assignment
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       404:
+ *         description: Event not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       422:
+ *         description: "Validation error. Possible messages: Invalid event ID format, Invalid query parameters"
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
+ */
+router.get("/:eventId/attendees", requireAuth, requireRole("STAFF", "ORGANIZER", "ADMIN"), validateParams(checkinListParamsSchema), validateQuery(attendeeLookupQuerySchema), checkinController.listEventAttendees);
 
 /**
  * @openapi

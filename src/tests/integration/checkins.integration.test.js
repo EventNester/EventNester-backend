@@ -362,6 +362,124 @@ describe('Checkins API Integration Tests', () => {
     });
   });
 
+  describe('GET /api/v1/checkins/:eventId/attendees', () => {
+    it('should return 401 without auth', async () => {
+      const response = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees`);
+
+      expect(response.status).toBe(401);
+    });
+
+    it('should return 403 for attendee role', async () => {
+      const attendeeReg = await request(app)
+        .post('/api/v1/auth/register')
+        .send({
+          name: 'Lookup Attendee',
+          email: 'lookup-attendee@example.com',
+          password: 'SecurePassword123',
+        });
+
+      const token = attendeeReg.body.data.accessToken;
+
+      const response = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(403);
+    });
+
+    it('should return 403 for unassigned staff', async () => {
+      const unassignedReg = await request(app)
+        .post('/api/v1/auth/register')
+        .send({
+          name: 'Unassigned Lookup Staff',
+          email: 'unassigned-lookup-staff@example.com',
+          password: 'SecurePassword123',
+          role: 'STAFF',
+        });
+
+      const token = unassignedReg.body.data.accessToken;
+
+      const response = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(403);
+      expect(response.body.status).toBe('error');
+    });
+
+    it('should return matching attendees for an organizer search by name', async () => {
+      const response = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees?q=Test`)
+        .set('Authorization', `Bearer ${organizerToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.attendees).toBeInstanceOf(Array);
+
+      const match = response.body.data.attendees.find(
+        (attendee) => attendee.attendeeName === 'Test Attendee'
+      );
+      expect(match).toBeDefined();
+      expect(match.attendeeEmail).toBe('attendee@example.com');
+      expect(match.confirmationCode).toBeDefined();
+      expect(match.ticketCode).toBeDefined();
+      expect(match.qr.token).toBeDefined();
+      expect(response.body.data.pagination).toBeDefined();
+    });
+
+    it('should return 200 for an active assigned staff member', async () => {
+      const response = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees`)
+        .set('Authorization', `Bearer ${staffToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.attendees).toBeInstanceOf(Array);
+    });
+
+    it('should allow staff to manually check in an attendee via the opaque qr token', async () => {
+      const manualTicketCode = await prisma.ticketCode.create({
+        data: {
+          eventId,
+          code: `TICKET-${randomBytes(4).toString('hex').toUpperCase()}`,
+          attendeeEmail: 'manual@example.com',
+          attendeeName: 'Manual Attendee',
+        },
+      });
+
+      const manualReg = await prisma.registration.create({
+        data: {
+          eventId,
+          ticketCodeId: manualTicketCode.id,
+          attendeeEmail: 'manual@example.com',
+          attendeeName: 'Manual Attendee',
+          source: 'IMPORT',
+          status: 'CONFIRMED',
+          confirmationCode: `CONF-${randomBytes(4).toString('hex').toUpperCase()}`,
+        },
+      });
+
+      const lookup = await request(app)
+        .get(`/api/v1/checkins/${eventId}/attendees?q=Manual`)
+        .set('Authorization', `Bearer ${staffToken}`);
+
+      expect(lookup.status).toBe(200);
+      const found = lookup.body.data.attendees.find((attendee) => attendee.id === manualReg.id);
+      expect(found).toBeDefined();
+
+      const response = await request(app)
+        .post(`/api/v1/checkins/${eventId}/scan`)
+        .set('Authorization', `Bearer ${staffToken}`)
+        .send({ token: found.qr.token });
+
+      expect(response.status).toBe(200);
+      expect(response.body.status).toBe('success');
+      expect(response.body.data.result).toBe('VALID');
+      expect(response.body.data.attendeeName).toBe('Manual Attendee');
+    });
+  });
+
   describe('POST /api/v1/checkins/:eventId/checkins/:checkInId/undo', () => {
     it('should return 403 for staff who is neither the owner nor the scanning staff', async () => {
       const response = await request(app)
